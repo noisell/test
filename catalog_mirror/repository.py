@@ -1,9 +1,4 @@
-"""Repository contract and a deterministic in-memory implementation.
-
-The implementation models the important database properties: stable operation
-identity, expiring leases, fencing and an atomic batch finish.  It is useful both
-as executable documentation and as a test double for the publisher.
-"""
+"""Repository contract and deterministic, atomic in-memory implementation."""
 
 from dataclasses import dataclass
 from threading import RLock
@@ -11,13 +6,8 @@ from typing import Dict, Iterable, Mapping, Optional, Protocol, Sequence
 from uuid import uuid4
 
 from .domain import (
-    CatalogChange,
-    Finish,
-    FinishKind,
-    FinishSummary,
-    LeaseBatch,
-    LeasedOperation,
-    OperationState,
+    CatalogChange, Finish, FinishKind, FinishSummary, LeaseBatch,
+    LeasedOperation, OperationState,
 )
 
 
@@ -31,10 +21,7 @@ class StorageError(RuntimeError):
 
 class CatalogRepository(Protocol):
     def claim_due(self, now: float, lease_seconds: int, limit: int) -> LeaseBatch: ...
-
-    def finish_batch(
-        self, lease_token: str, finishes: Sequence[Finish], now: float
-    ) -> FinishSummary: ...
+    def finish_batch(self, lease_token: str, finishes: Sequence[Finish], now: float) -> FinishSummary: ...
 
 
 @dataclass
@@ -73,10 +60,9 @@ class InMemoryCatalogRepository:
             raise ValueError("lease_seconds and limit must be positive")
         with self._lock:
             candidates = [
-                row
-                for row in self._rows.values()
-                if row.state is OperationState.PENDING and row.due_at <= now
-                or row.state is OperationState.LEASED and row.leased_until <= now
+                row for row in self._rows.values()
+                if (row.state is OperationState.PENDING and row.due_at <= now)
+                or (row.state is OperationState.LEASED and row.leased_until <= now)
             ]
             candidates.sort(key=lambda row: (row.due_at, row.change.operation_id))
             selected = candidates[:limit]
@@ -88,57 +74,75 @@ class InMemoryCatalogRepository:
                 row.attempt += 1
             operations = tuple(
                 LeasedOperation(
-                    row.change.operation_id,
-                    row.change.item_id,
-                    row.change.version,
-                    dict(row.change.fields),
-                    row.attempt,
+                    row.change.operation_id, row.change.item_id,
+                    row.change.version, dict(row.change.fields), row.attempt,
                 )
                 for row in selected
             )
             return LeaseBatch(token, operations)
 
     def finish_one(self, lease_token: str, finish: Finish, now: float) -> FinishSummary:
-        """Compatibility API for an older single-operation publisher."""
+        """Compatibility API for the legacy single-operation caller."""
         return self.finish_batch(lease_token, [finish], now)
 
-    def finish_batch(
-        self, lease_token: str, finishes: Sequence[Finish], now: float
-    ) -> FinishSummary:
+    def finish_batch(self, lease_token: str, finishes: Sequence[Finish], now: float) -> FinishSummary:
         with self._lock:
-            if self.fail_next_finish:
-                self.fail_next_finish = False
-                raise StorageError("injected commit failure")
             operation_ids = [finish.operation_id for finish in finishes]
             if len(operation_ids) != len(set(operation_ids)):
                 raise ValueError("finish operation_id values must be unique")
+
+            # Validate the complete lease cohort before changing any row. This
+            # prevents callers from committing only a subset of their batch.
+            leased_ids = {
+                operation_id for operation_id, row in self._rows.items()
+                if row.state is OperationState.LEASED and row.lease_token == lease_token
+            }
+            if set(operation_ids) != leased_ids or len(operation_ids) != len(leased_ids):
+                raise LeaseLost("finish set does not match lease cohort")
+
             rows = []
             for operation_id in operation_ids:
                 row = self._rows.get(operation_id)
-                if row is None or row.state is not OperationState.LEASED:
-                    raise LeaseLost(operation_id)
-                if row.lease_token != lease_token or row.leased_until <= now:
+                if (row is None or row.state is not OperationState.LEASED
+                        or row.lease_token != lease_token or row.leased_until <= now):
                     raise LeaseLost(operation_id)
                 rows.append(row)
-            accepted = retried = rejected = obsolete = 0
+
+            # Simulate transaction commit failure before the first mutation.
+            if self.fail_next_finish:
+                self.fail_next_finish = False
+                raise StorageError("injected commit failure")
+
+            # Compute all target states first; the mutation section below is the
+            # in-memory equivalent of one database transaction commit.
+            transitions = []
             for row, finish in zip(rows, finishes):
                 if finish.kind is FinishKind.RETRY:
-                    row.state = OperationState.PENDING
-                    row.due_at = finish.retry_at if finish.retry_at is not None else now
-                    row.lease_token = None
-                    retried += 1
+                    transitions.append((OperationState.PENDING, None, finish.retry_at if finish.retry_at is not None else now, None))
                 elif finish.kind is FinishKind.REJECT:
-                    row.state = OperationState.REJECTED
-                    row.reason = finish.reason
-                    rejected += 1
+                    transitions.append((OperationState.REJECTED, None, row.due_at, finish.reason))
                 elif row.change.version < self._latest_version[row.change.item_id]:
-                    row.state = OperationState.OBSOLETE
-                    obsolete += 1
+                    transitions.append((OperationState.OBSOLETE, None, row.due_at, None))
                 else:
-                    row.state = OperationState.ACKED
+                    transitions.append((OperationState.ACKED, row.change.version, row.due_at, None))
+
+            accepted = retried = rejected = obsolete = 0
+            for row, (state, published, due_at, reason) in zip(rows, transitions):
+                row.state = state
+                row.lease_token = None
+                row.leased_until = 0.0
+                row.due_at = due_at
+                row.reason = reason
+                if state is OperationState.ACKED:
                     previous = self._published_version.get(row.change.item_id, -1)
-                    self._published_version[row.change.item_id] = max(previous, row.change.version)
+                    self._published_version[row.change.item_id] = max(previous, published)
                     accepted += 1
+                elif state is OperationState.PENDING:
+                    retried += 1
+                elif state is OperationState.REJECTED:
+                    rejected += 1
+                elif state is OperationState.OBSOLETE:
+                    obsolete += 1
             return FinishSummary(accepted, retried, rejected, obsolete)
 
     def state(self, operation_id: str) -> OperationState:
@@ -160,4 +164,3 @@ class InMemoryCatalogRepository:
     def snapshot(self) -> Mapping[str, OperationState]:
         with self._lock:
             return {key: row.state for key, row in self._rows.items()}
-
