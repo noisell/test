@@ -37,6 +37,11 @@ class CatalogPublisher:
             results = list(self.gateway.publish(batch.operations))
         except TemporaryGatewayError:
             results = self._retry_results(batch.operations, "transport")
+        except TypeError:
+            # A gateway violating its return-shape contract is treated as a
+            # malformed response, never allowed to crash or partially commit.
+            results = []
+            protocol_error = True
 
         # Validate the complete response before constructing or persisting any
         # transition. A malformed batch is retried as one idempotent unit.
@@ -48,7 +53,9 @@ class CatalogPublisher:
                 protocol_error = True
                 break
             operation_id = result.operation_id
-            if operation_id not in requested or operation_id in by_id:
+            if (not isinstance(operation_id, str) or
+                    not isinstance(result.kind, ResultKind) or
+                    operation_id not in requested or operation_id in by_id):
                 protocol_error = True
                 break
             by_id[operation_id] = result
