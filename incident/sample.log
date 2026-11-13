@@ -1,0 +1,7 @@
+2026-07-18T09:14:22.314Z level=INFO event=catalog.bulk.request lease=4f2 count=3 operation_ids=op-871,op-872,op-873
+2026-07-18T09:14:22.401Z level=INFO event=catalog.bulk.response count=3 results=op-873:rejected,op-871:accepted,op-872:retryable
+2026-07-18T09:14:22.405Z level=INFO event=catalog.finish operation_id=op-871 state=rejected reason="unknown warehouse"
+2026-07-18T09:14:22.409Z level=INFO event=catalog.finish operation_id=op-872 state=acked
+2026-07-18T09:14:22.412Z level=ERROR event=catalog.finish operation_id=op-873 error="storage timeout during finish"
+2026-07-18T09:14:54.107Z level=INFO event=catalog.bulk.request lease=5a9 count=1 operation_ids=op-873
+2026-07-18T09:14:54.190Z level=INFO event=catalog.bulk.response count=1 results=op-873:rejected
