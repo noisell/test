@@ -35,7 +35,7 @@ class JsonBulkGateway:
         }
         try:
             response = self.post_json(self.endpoint, request)
-        except (TimeoutError, ConnectionError, ValueError) as error:
+        except (OSError, ValueError) as error:
             # ValueError includes JSON decoding failures in common adapters.
             raise TemporaryGatewayError(str(error)) from error
         if not isinstance(response, Mapping):
