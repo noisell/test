@@ -3,9 +3,9 @@
 import unittest
 
 from catalog_mirror import (
-    CatalogChange, CatalogPublisher, ExponentialBackoff, GatewayResult,
-    InMemoryCatalogRepository, InMemoryMetrics, OperationState, ResultKind,
-    TemporaryGatewayError,
+    CatalogChange, CatalogPublisher, ExponentialBackoff, Finish, FinishKind,
+    GatewayResult, InMemoryCatalogRepository, InMemoryMetrics, LeaseLost,
+    OperationState, ResultKind, TemporaryGatewayError,
 )
 from tests.fakes import FakeClock, ScriptedGateway
 
@@ -31,11 +31,12 @@ class CandidateInteractionTests(unittest.TestCase):
         self.assertEqual(repo.state("c"), OperationState.REJECTED)
 
     def test_duplicate_unknown_and_missing_ids_retry_entire_batch(self):
-        for results in (
+        malformed = (
             [GatewayResult("a", ResultKind.ACCEPTED), GatewayResult("a", ResultKind.ACCEPTED)],
             [GatewayResult("a", ResultKind.ACCEPTED), GatewayResult("ghost", ResultKind.ACCEPTED)],
             [GatewayResult("a", ResultKind.ACCEPTED)],
-        ):
+        )
+        for results in malformed:
             repo, _, _, _, publisher = self.setup_case(
                 [CatalogChange("a", "a", 1, {}), CatalogChange("b", "b", 1, {})], [results]
             )
@@ -45,15 +46,14 @@ class CandidateInteractionTests(unittest.TestCase):
             self.assertTrue(all(s is OperationState.PENDING for s in repo.snapshot().values()))
 
     def test_transport_error_retries_all_with_stable_operation_ids(self):
-        repo, gateway, _, _, publisher = self.setup_case(
+        repo, gateway, _, clock, publisher = self.setup_case(
             [CatalogChange("a", "a", 1, {}), CatalogChange("b", "b", 1, {})],
             [TemporaryGatewayError("offline"), [GatewayResult("a", ResultKind.ACCEPTED), GatewayResult("b", ResultKind.ACCEPTED)]],
         )
         first = publisher.run_once()
         self.assertEqual(first.retried, 2)
         self.assertEqual([op.operation_id for op in gateway.calls[0]], ["a", "b"])
-        repo._rows["a"].due_at = 0
-        repo._rows["b"].due_at = 0
+        clock.advance(5)
         second = publisher.run_once()
         self.assertEqual(second.accepted, 2)
         self.assertEqual([op.operation_id for op in gateway.calls[1]], ["a", "b"])
@@ -68,8 +68,7 @@ class CandidateInteractionTests(unittest.TestCase):
 
         repo = InMemoryCatalogRepository([CatalogChange("a", "sku", 1, {})])
         clock = FakeClock()
-        metrics = InMemoryMetrics()
-        publisher = CatalogPublisher(repo, SlowGateway(clock), metrics, clock, ExponentialBackoff(), 30)
+        publisher = CatalogPublisher(repo, SlowGateway(clock), InMemoryMetrics(), clock, ExponentialBackoff(), 30)
         report = publisher.run_once()
         self.assertEqual(report.accepted, 0)
         self.assertEqual(report.lease_lost, 1)
@@ -89,21 +88,21 @@ class CandidateInteractionTests(unittest.TestCase):
         self.assertEqual(snapshot.get("catalog.accepted", 0), 0)
         self.assertEqual(snapshot.get("catalog.rejected", 0), 0)
 
-    def test_old_accepted_version_becomes_obsolete_without_downgrade(self):
+    def test_old_ack_after_newer_publish_is_obsolete_and_cannot_downgrade(self):
         repo = InMemoryCatalogRepository([CatalogChange("old", "sku", 1, {})])
         repo.enqueue(CatalogChange("new", "sku", 2, {}))
-        batch = repo.claim_due(1000, 30, 1)
-        summary = repo.finish_batch(batch.lease_token, [__import__("catalog_mirror").Finish("old", __import__("catalog_mirror").FinishKind.ACK)], 1000)
-        self.assertEqual(summary.obsolete, 1)
-        self.assertIsNone(repo.published_version("sku"))
-        batch2 = repo.claim_due(1000, 30, 1)
-        repo.finish_batch(batch2.lease_token, [__import__("catalog_mirror").Finish("new", __import__("catalog_mirror").FinishKind.ACK)], 1000)
+        old_batch = repo.claim_due(1000, 30, 1)
+        new_batch = repo.claim_due(1000, 30, 1)
+        new_summary = repo.finish_batch(new_batch.lease_token, [Finish("new", FinishKind.ACK)], 1000)
+        old_summary = repo.finish_batch(old_batch.lease_token, [Finish("old", FinishKind.ACK)], 1000)
+        self.assertEqual(new_summary.accepted, 1)
+        self.assertEqual(old_summary.obsolete, 1)
         self.assertEqual(repo.published_version("sku"), 2)
+        self.assertEqual(repo.state("old"), OperationState.OBSOLETE)
 
-    def test_partial_repository_finish_is_rejected_without_mutation(self):
+    def test_repository_rejects_partial_finish_without_mutation(self):
         repo = InMemoryCatalogRepository([CatalogChange("a", "a", 1, {}), CatalogChange("b", "b", 1, {})])
         batch = repo.claim_due(1000, 30, 2)
-        from catalog_mirror import Finish, FinishKind, LeaseLost
         with self.assertRaises(LeaseLost):
             repo.finish_batch(batch.lease_token, [Finish("a", FinishKind.ACK)], 1000)
         self.assertEqual(repo.state("a"), OperationState.LEASED)
