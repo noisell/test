@@ -89,16 +89,16 @@ class CandidateInteractionTests(unittest.TestCase):
         self.assertEqual(snapshot.get("catalog.rejected", 0), 0)
 
     def test_old_ack_after_newer_publish_is_obsolete_and_cannot_downgrade(self):
-        repo = InMemoryCatalogRepository([CatalogChange("old", "sku", 1, {})])
-        repo.enqueue(CatalogChange("new", "sku", 2, {}))
+        repo = InMemoryCatalogRepository([CatalogChange("a-old", "sku", 1, {})])
+        repo.enqueue(CatalogChange("z-new", "sku", 2, {}))
         old_batch = repo.claim_due(1000, 30, 1)
         new_batch = repo.claim_due(1000, 30, 1)
-        new_summary = repo.finish_batch(new_batch.lease_token, [Finish("new", FinishKind.ACK)], 1000)
-        old_summary = repo.finish_batch(old_batch.lease_token, [Finish("old", FinishKind.ACK)], 1000)
+        new_summary = repo.finish_batch(new_batch.lease_token, [Finish("z-new", FinishKind.ACK)], 1000)
+        old_summary = repo.finish_batch(old_batch.lease_token, [Finish("a-old", FinishKind.ACK)], 1000)
         self.assertEqual(new_summary.accepted, 1)
         self.assertEqual(old_summary.obsolete, 1)
         self.assertEqual(repo.published_version("sku"), 2)
-        self.assertEqual(repo.state("old"), OperationState.OBSOLETE)
+        self.assertEqual(repo.state("a-old"), OperationState.OBSOLETE)
 
     def test_repository_rejects_partial_finish_without_mutation(self):
         repo = InMemoryCatalogRepository([CatalogChange("a", "a", 1, {}), CatalogChange("b", "b", 1, {})])
