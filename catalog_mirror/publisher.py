@@ -35,7 +35,7 @@ class CatalogPublisher:
         protocol_error = False
         try:
             results = list(self.gateway.publish(batch.operations))
-        except TemporaryGatewayError:
+        except (TemporaryGatewayError, OSError):
             results = self._retry_results(batch.operations, "transport")
         except TypeError:
             # A gateway violating its return-shape contract is treated as a
